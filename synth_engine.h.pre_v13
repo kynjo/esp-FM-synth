@@ -1,0 +1,177 @@
+/**
+ * @file synth_engine.h
+ * @brief 3-Operator Polyphonic Phase Modulation (FM) Synthesizer DSP Engine
+ *
+ * Core 1 Real-time Audio synthesis thread with 8-voice polyphony,
+ * 2048 Sine LUT linear interpolation, 10 waveforms, 8 FM algorithms plus
+ * a pure-sine diagnostic mode, stable TPT state-variable filter, dual LFOs,
+ * portamento, and ADSR envelopes.
+ */
+
+#ifndef SYNTH_ENGINE_H
+#define SYNTH_ENGINE_H
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <stddef.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define SYNTH_SAMPLE_RATE     (44100)
+#define SYNTH_DMA_BUFFER_SIZE (64)
+#define SYNTH_MAX_VOICES      (8)
+#define SINE_LUT_SIZE         (2048)
+
+/* Waveform types */
+typedef enum {
+    WAVE_SINE = 0,
+    WAVE_TRIANGLE,
+    WAVE_SAW,
+    WAVE_SQUARE,
+    WAVE_PULSE25,
+    WAVE_HALF_SINE,
+    WAVE_ABS_SINE,
+    WAVE_DOUBLE_SINE,
+    WAVE_FORMANT,
+    WAVE_NOISE,
+    WAVE_COUNT
+} waveform_t;
+
+/* Envelope stages */
+typedef enum {
+    ENV_IDLE = 0,
+    ENV_ATTACK,
+    ENV_DECAY,
+    ENV_SUSTAIN,
+    ENV_RELEASE
+} env_stage_t;
+
+/* ADSR Envelope struct */
+typedef struct {
+    float attack_ms;
+    float decay_ms;
+    float sustain_level;
+    float release_ms;
+} adsr_params_t;
+
+typedef struct {
+    env_stage_t stage;
+    float current_level;
+    float target_sustain;
+    float attack_step;
+    float decay_factor;
+    float release_factor;
+} adsr_state_t;
+
+/* Operator parameters */
+typedef struct {
+    waveform_t waveform;
+    float ratio;           // 0.25 to 32.0
+    float detune_cents;    // -50.0 to +50.0
+    float level;           // 0.0 to 1.0 (modulation index or carrier volume)
+    float feedback;        // 0.0 to 1.0
+    float velocity_sens;   // 0.0 to 1.0
+    float key_scaling;     // 0.0 to 1.0
+    adsr_params_t env;
+} op_params_t;
+
+/* Filter types */
+typedef enum {
+    FILTER_LOWPASS = 0,
+    FILTER_BANDPASS,
+    FILTER_HIGHPASS
+} filter_type_t;
+
+typedef struct {
+    filter_type_t type;
+    float cutoff_hz;       // 20 to 20000 Hz
+    float resonance;       // 0.5 to 10.0 (Q factor)
+    float env_amount;      // -1.0 to 1.0
+    adsr_params_t env;
+} filter_params_t;
+
+/* LFO settings */
+typedef enum {
+    LFO_DEST_PITCH = 0,
+    LFO_DEST_CUTOFF,
+    LFO_DEST_FM_INDEX,
+    LFO_DEST_AMP
+} lfo_dest_t;
+
+typedef struct {
+    waveform_t waveform;
+    float rate_hz;
+    float depth;
+    lfo_dest_t destination;
+} lfo_params_t;
+
+/* Patch structure containing complete synth settings */
+typedef struct {
+    char name[24];
+    uint8_t algorithm;      // 0 to 8 (8 = pure Op1 sine test)
+    float master_volume;    // 0.0 to 1.0
+    float glide_ms;         // 0 to 1000 ms
+    uint8_t polyphony;      // 1 to 8
+    op_params_t op[3];      // Op 0, 1, 2 (corresponds to Op1, Op2, Op3)
+    filter_params_t filter;
+    lfo_params_t lfo1;
+    lfo_params_t lfo2;
+} synth_patch_t;
+
+/* Voice state */
+typedef struct {
+    bool active;
+    uint8_t midi_note;
+    float velocity;
+    float target_freq;
+    float current_freq;
+    uint32_t age;
+
+    // Phase accumulators [0.0, 1.0)
+    float phase[3];
+    // Feedback memory
+    float fb[3];
+
+    // Envelopes
+    adsr_state_t env[3];
+    adsr_state_t filter_env;
+
+    // TPT state-variable filter integrator memory
+    float svf_ic1;
+    float svf_ic2;
+} synth_voice_t;
+
+/* Master Synth Engine State */
+typedef struct {
+    synth_patch_t patch;
+    synth_voice_t voices[SYNTH_MAX_VOICES];
+    float lfo1_phase;
+    float lfo2_phase;
+    float pitch_bend;       // In semitones (-2.0 to +2.0)
+    float mod_wheel;        // 0.0 to 1.0
+    uint8_t active_voices;
+    float scope_buffer[128];// Mini buffer for OLED oscilloscope display
+} synth_engine_t;
+
+extern synth_engine_t g_synth;
+
+/* Function prototypes */
+void synth_engine_init(void);
+void synth_load_patch(const synth_patch_t *patch);
+void synth_note_on(uint8_t note, uint8_t velocity);
+void synth_note_off(uint8_t note);
+void synth_all_notes_off(void);
+void synth_set_pitch_bend(int16_t bend_raw); // 14-bit MIDI bend (0..16383, 8192 center)
+void synth_set_mod_wheel(uint8_t val);
+void synth_set_cc(uint8_t cc_num, uint8_t val);
+
+/* Core 1 Real-time synthesis audio loop */
+void synth_audio_task(void *pvParameters);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif // SYNTH_ENGINE_H

@@ -1,0 +1,526 @@
+/**
+ * @file ui_menu.c
+ * @brief OLED UI, parameter editor, encoder and preset selector.
+ */
+#include "ui_menu.h"
+#include "sh1106.h"
+#include "synth_engine.h"
+#include "preset_manager.h"
+#include "pin_config.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/gpio.h"
+#include "esp_log.h"
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+
+static const char *TAG = "UI_MENU";
+static menu_page_t s_current_page = PAGE_DASHBOARD;
+static uint8_t s_selected_row = 0;
+static bool s_edit_mode = false;
+static bool s_preset_mode = false;
+static uint8_t s_enc_state = 0;
+static int8_t s_enc_accum = 0;
+static bool s_ui_dirty = true;
+
+static const char *PAGE_NAMES[PAGE_COUNT] = {
+    "DASHBOARD", "ALGORITHM", "OPERATOR 1", "OP1 ENVELOPE",
+    "OPERATOR 2", "OP2 ENVELOPE", "OPERATOR 3", "OP3 ENVELOPE",
+    "FILTER / ENV", "LFO & MOD", "SYSTEM / PINS"
+};
+
+static const char *WAVE_NAMES[WAVE_COUNT] = {
+    "Sine", "Triangle", "Saw", "Square", "Pulse25",
+    "HalfSin", "AbsSin", "DblSin", "Formant", "Noise"
+};
+
+static int page_row_count(void)
+{
+    if (s_preset_mode) return 1;
+    switch (s_current_page) {
+        case PAGE_DASHBOARD: return 6;              // Volume, polyphony, glide, mode, unison voices, spread
+        case PAGE_ALGORITHM: return 1;
+        case PAGE_OP1:
+        case PAGE_OP2:
+        case PAGE_OP3: return 8;                    // carrier, PM, feedback, velocity/key scaling
+        case PAGE_OP1_ENV:
+        case PAGE_OP2_ENV:
+        case PAGE_OP3_ENV: return 6;                 // ADSR + velocity/key scaling
+        case PAGE_FILTER: return 8;                 // cutoff, resonance, env, type + ADSR
+        case PAGE_LFO: return 9;                    // LFO1 x4, LFO2 x4, glide
+        default: return 0;
+    }
+}
+
+static int visible_row_start(int total)
+{
+    if (total <= 5 || s_selected_row < 3) return 0;
+    int start = (int)s_selected_row - 2;
+    if (start > total - 5) start = total - 5;
+    return start;
+}
+
+static bool row_selected(int row)
+{
+    return s_selected_row == (uint8_t)row;
+}
+
+static void draw_row(int y, int row, const char *text)
+{
+    if (row_selected(row) && s_edit_mode) {
+        sh1106_draw_string_inverted(2, y, text);
+    } else {
+        if (row_selected(row)) sh1106_draw_string(2, y, ">", true);
+        sh1106_draw_string(10, y, text, true);
+    }
+}
+
+static void draw_header(void)
+{
+    char header[32];
+    snprintf(header, sizeof(header), "%d/%d %s", s_current_page + 1, PAGE_COUNT, PAGE_NAMES[s_current_page]);
+    sh1106_draw_string(2, 1, header, true);
+    sh1106_draw_line(0, 9, 127, 9, true);
+}
+
+static void draw_dashboard(void)
+{
+    draw_header();
+    const int total = 6;
+    const int start = visible_row_start(total);
+    char line[32];
+    for (int row = start; row < start + 5 && row < total; ++row) {
+        switch (row) {
+            case 0: snprintf(line, sizeof(line), "Volume: %d%%", (int)(g_synth.patch.master_volume * 100)); break;
+            case 1: snprintf(line, sizeof(line), "Polyphony: %d", g_synth.patch.polyphony); break;
+            case 2: snprintf(line, sizeof(line), "Glide: %dms", (int)g_synth.patch.glide_ms); break;
+            case 3: { static const char *modes[] = {"POLY","MONO","UNISON","LEGATO"}; uint8_t m=g_synth.patch.poly_mode<=POLY_MODE_LEGATO?g_synth.patch.poly_mode:0; snprintf(line,sizeof(line),"Mode: %s",modes[m]); break; }
+            case 4: snprintf(line, sizeof(line), "Unison: %d", g_synth.patch.unison_voices); break;
+            default: snprintf(line, sizeof(line), "Spread: %dct", (int)g_synth.patch.unison_spread_cents); break;
+        }
+        draw_row(12 + (row - start) * 10, row, line);
+    }
+}
+
+static void draw_algorithm_page(void)
+{
+    draw_header();
+    static const char *names[SYNTH_ALGORITHM_COUNT] = {
+        "3->2->1", "(2+3)->1", "3->(1+2)", "(3->2)+1",
+        "1+2+3", "FB:3*->2->1", "FB:3->2*->1", "FB:3->2->1*"
+    };
+    char line[32];
+    int alg = g_synth.patch.algorithm;
+    if (alg >= SYNTH_ALGORITHM_COUNT) alg = 0;
+    snprintf(line, sizeof(line), "Alg %d: %s", alg + 1, names[alg]);
+    draw_row(15, 0, line);
+    sh1106_draw_string(2, 29, "Diag: presets 17-27", true);
+    sh1106_draw_string(2, 41, "Level=carrier", true);
+    sh1106_draw_string(2, 52, "PM Index=mod depth", true);
+}
+
+static void draw_op_page(int op_idx)
+{
+    draw_header();
+    op_params_t *op = &g_synth.patch.op[op_idx];
+    const int total = 8;
+    const int start = visible_row_start(total);
+    char line[32];
+    for (int row = start; row < start + 5 && row < total; ++row) {
+        switch (row) {
+            case 0: {
+                int w = (int)op->waveform;
+                if (w < 0 || w >= WAVE_COUNT) w = 0;
+                snprintf(line, sizeof(line), "Wave: %s", WAVE_NAMES[w]);
+                break;
+            }
+            case 1: snprintf(line, sizeof(line), "Ratio: %.2f", op->ratio); break;
+            case 2: snprintf(line, sizeof(line), "Detune: %+.0fc", op->detune_cents); break;
+            case 3: snprintf(line, sizeof(line), "Carrier: %d%%", (int)(op->carrier_level * 100)); break;
+            case 4: snprintf(line, sizeof(line), "PM Index: %d%%", (int)(op->pm_index * 100)); break;
+            case 5: snprintf(line, sizeof(line), "Feedback: %d%%", (int)(op->feedback * 100)); break;
+            case 6: snprintf(line, sizeof(line), "Vel Sens: %d%%", (int)(op->velocity_sens * 100)); break;
+            default: snprintf(line, sizeof(line), "Key Scale: %d%%", (int)(op->key_scaling * 100)); break;
+        }
+        draw_row(12 + (row - start) * 10, row, line);
+    }
+}
+
+static void draw_env_page(int op_idx)
+{
+    draw_header();
+    adsr_params_t *env = &g_synth.patch.op[op_idx].env;
+    op_params_t *op = &g_synth.patch.op[op_idx];
+    const int total = 6;
+    const int start = visible_row_start(total);
+    char line[32];
+    for (int row = start; row < start + 5 && row < total; ++row) {
+        switch (row) {
+            case 0: snprintf(line, sizeof(line), "Attack: %dms", (int)env->attack_ms); break;
+            case 1: snprintf(line, sizeof(line), "Decay: %dms", (int)env->decay_ms); break;
+            case 2: snprintf(line, sizeof(line), "Sustain: %d%%", (int)(env->sustain_level * 100)); break;
+            case 3: snprintf(line, sizeof(line), "Release: %dms", (int)env->release_ms); break;
+            case 4: snprintf(line, sizeof(line), "Vel Sens: %d%%", (int)(op->velocity_sens * 100)); break;
+            default: snprintf(line, sizeof(line), "Key Scale: %d%%", (int)(op->key_scaling * 100)); break;
+        }
+        draw_row(12 + (row - start) * 10, row, line);
+    }
+}
+
+static void draw_filter_page(void)
+{
+    draw_header();
+    filter_params_t *f = &g_synth.patch.filter;
+    const int total = 8;
+    const int start = visible_row_start(total);
+    char line[32];
+    for (int row = start; row < start + 5 && row < total; ++row) {
+        switch (row) {
+            case 0: snprintf(line, sizeof(line), "Cutoff: %dHz", (int)f->cutoff_hz); break;
+            case 1: snprintf(line, sizeof(line), "Resonance: %.1f", f->resonance); break;
+            case 2: snprintf(line, sizeof(line), "Env Amt: %+d%%", (int)(f->env_amount * 100)); break;
+            case 3: snprintf(line, sizeof(line), "Type: %s", f->type == FILTER_LOWPASS ? "LowPass" : (f->type == FILTER_BANDPASS ? "BandPass" : "HighPass")); break;
+            case 4: snprintf(line, sizeof(line), "Env Attack: %dms", (int)f->env.attack_ms); break;
+            case 5: snprintf(line, sizeof(line), "Env Decay: %dms", (int)f->env.decay_ms); break;
+            case 6: snprintf(line, sizeof(line), "Env Sustain: %d%%", (int)(f->env.sustain_level * 100)); break;
+            default: snprintf(line, sizeof(line), "Env Release: %dms", (int)f->env.release_ms); break;
+        }
+        draw_row(12 + (row - start) * 10, row, line);
+    }
+}
+
+static void draw_lfo_page(void)
+{
+    draw_header();
+    const int total = 9;
+    const int start = visible_row_start(total);
+    char line[32];
+    for (int row = start; row < start + 5 && row < total; ++row) {
+        const lfo_params_t *l = row < 4 ? &g_synth.patch.lfo1 : &g_synth.patch.lfo2;
+        int sub = row < 4 ? row : row - 4;
+        if (row == 8) {
+            snprintf(line, sizeof(line), "Glide: %dms", (int)g_synth.patch.glide_ms);
+        } else if (sub == 0) {
+            int w = (int)l->waveform;
+            if (w < 0 || w >= WAVE_COUNT) w = 0;
+            snprintf(line, sizeof(line), "LFO%d Wave: %s", row < 4 ? 1 : 2, WAVE_NAMES[w]);
+        } else if (sub == 1) {
+            snprintf(line, sizeof(line), "LFO%d Rate: %.1fHz", row < 4 ? 1 : 2, l->rate_hz);
+        } else if (sub == 2) {
+            snprintf(line, sizeof(line), "LFO%d Depth: %d%%", row < 4 ? 1 : 2, (int)(l->depth * 100));
+        } else {
+            const char *dest = l->destination == LFO_DEST_PITCH ? "Pitch" :
+                               l->destination == LFO_DEST_CUTOFF ? "Cutoff" :
+                               l->destination == LFO_DEST_FM_INDEX ? "FM Index" : "Amp";
+            snprintf(line, sizeof(line), "LFO%d Dest: %s", row < 4 ? 1 : 2, dest);
+        }
+        draw_row(12 + (row - start) * 10, row, line);
+    }
+}
+
+static void draw_system_page(void)
+{
+    draw_header();
+    sh1106_draw_string(2, 14, "Long press = presets", true);
+    sh1106_draw_string(2, 25, "Click = edit/load", true);
+    sh1106_draw_string(2, 36, "PREV/NEXT = pages", true);
+    sh1106_draw_string(2, 47, "USB MIDI + PCM5102A", true);
+}
+
+static void draw_preset_page(void)
+{
+    sh1106_clear();
+    char line[32];
+    snprintf(line, sizeof(line), "PRESET %02d/%02d", preset_manager_current() + 1, PRESET_COUNT);
+    sh1106_draw_string(2, 1, line, true);
+    sh1106_draw_line(0, 9, 127, 9, true);
+    sh1106_draw_string(2, 20, preset_manager_name(preset_manager_current()), true);
+    sh1106_draw_string(2, 38, "TURN: select", true);
+    sh1106_draw_string(2, 49, "CLICK: load", true);
+}
+
+void ui_menu_render(void)
+{
+    sh1106_clear();
+    if (s_preset_mode) {
+        draw_preset_page();
+    } else {
+        switch (s_current_page) {
+            case PAGE_DASHBOARD: draw_dashboard(); break;
+            case PAGE_ALGORITHM: draw_algorithm_page(); break;
+            case PAGE_OP1: draw_op_page(0); break;
+            case PAGE_OP1_ENV: draw_env_page(0); break;
+            case PAGE_OP2: draw_op_page(1); break;
+            case PAGE_OP2_ENV: draw_env_page(1); break;
+            case PAGE_OP3: draw_op_page(2); break;
+            case PAGE_OP3_ENV: draw_env_page(2); break;
+            case PAGE_FILTER: draw_filter_page(); break;
+            case PAGE_LFO: draw_lfo_page(); break;
+            case PAGE_SYSTEM: draw_system_page(); break;
+            default: break;
+        }
+    }
+    sh1106_flush();
+}
+
+static int current_op_index(void)
+{
+    return s_current_page == PAGE_OP1 || s_current_page == PAGE_OP1_ENV ? 0 :
+           s_current_page == PAGE_OP2 || s_current_page == PAGE_OP2_ENV ? 1 : 2;
+}
+
+static float clampf_local(float v, float lo, float hi)
+{
+    return fmaxf(lo, fminf(hi, v));
+}
+
+void ui_menu_handle_event(ui_event_t evt)
+{
+    if (s_preset_mode) {
+        if (evt.type == EVT_ENC_LONG) {
+            s_preset_mode = false;
+            s_edit_mode = false;
+        } else if (evt.type == EVT_ENC_ROTATE_CW) {
+            preset_manager_select(+1);
+        } else if (evt.type == EVT_ENC_ROTATE_CCW) {
+            preset_manager_select(-1);
+        } else if (evt.type == EVT_ENC_CLICK) {
+            preset_manager_load(preset_manager_current());
+            s_preset_mode = false;
+            s_edit_mode = false;
+            s_selected_row = 0;
+        }
+        s_ui_dirty = true;
+        return;
+    }
+
+    switch (evt.type) {
+        case EVT_BTN_PREV:
+            s_edit_mode = false;
+            s_current_page = s_current_page == 0 ? PAGE_COUNT - 1 : s_current_page - 1;
+            s_selected_row = 0;
+            break;
+        case EVT_BTN_NEXT:
+            s_edit_mode = false;
+            s_current_page = (s_current_page + 1) % PAGE_COUNT;
+            s_selected_row = 0;
+            break;
+        case EVT_ENC_LONG:
+            s_edit_mode = false;
+            s_preset_mode = true;
+            s_selected_row = 0;
+            break;
+        case EVT_ENC_CLICK:
+            s_edit_mode = !s_edit_mode;
+            break;
+        case EVT_ENC_ROTATE_CW:
+        case EVT_ENC_ROTATE_CCW: {
+            int delta = evt.type == EVT_ENC_ROTATE_CW ? 1 : -1;
+            int total = page_row_count();
+            if (!s_edit_mode) {
+                if (total > 0) {
+                    s_selected_row = (uint8_t)(((int)s_selected_row + delta + total) % total);
+                }
+                break;
+            }
+
+            bool reset_scene = false;
+            synth_patch_lock();
+            switch (s_current_page) {
+                case PAGE_DASHBOARD:
+                    if (s_selected_row == 0) g_synth.patch.master_volume = clampf_local(g_synth.patch.master_volume + delta * 0.02f, 0.0f, 1.0f);
+                    else if (s_selected_row == 1) { g_synth.patch.polyphony = (uint8_t)clampf_local(g_synth.patch.polyphony + delta, 1, SYNTH_MAX_VOICES); reset_scene = true; }
+                    else if (s_selected_row == 2) g_synth.patch.glide_ms = clampf_local(g_synth.patch.glide_ms + delta * 10.0f, 0.0f, 1000.0f);
+                    else if (s_selected_row == 3) { int m = (int)g_synth.patch.poly_mode + delta; if (m < 0) m = POLY_MODE_LEGATO; if (m > POLY_MODE_LEGATO) m = POLY_MODE_POLY; g_synth.patch.poly_mode = (uint8_t)m; reset_scene = true; }
+                    else if (s_selected_row == 4) { g_synth.patch.unison_voices = (uint8_t)clampf_local(g_synth.patch.unison_voices + delta, 1, SYNTH_MAX_VOICES); reset_scene = true; }
+                    else if (s_selected_row == 5) { g_synth.patch.unison_spread_cents = clampf_local(g_synth.patch.unison_spread_cents + delta, 0.0f, 100.0f); reset_scene = true; }
+                    break;
+                case PAGE_ALGORITHM: {
+                    int v = (int)g_synth.patch.algorithm + delta;
+                    if (v < 0) v = SYNTH_ALGORITHM_COUNT - 1;
+                    if (v >= SYNTH_ALGORITHM_COUNT) v = 0;
+                    g_synth.patch.algorithm = (uint8_t)v;
+                    reset_scene = true;
+                    break;
+                }
+                case PAGE_OP1:
+                case PAGE_OP2:
+                case PAGE_OP3: {
+                    op_params_t *op = &g_synth.patch.op[current_op_index()];
+                    switch (s_selected_row) {
+                        case 0: { int v = (int)op->waveform + delta; if (v < 0) v = WAVE_COUNT - 1; if (v >= WAVE_COUNT) v = 0; op->waveform = (waveform_t)v; break; }
+                        case 1: op->ratio = clampf_local(op->ratio + delta * 0.25f, 0.25f, 32.0f); break;
+                        case 2: op->detune_cents = clampf_local(op->detune_cents + delta, -50.0f, 50.0f); break;
+                        case 3: op->carrier_level = clampf_local(op->carrier_level + delta * 0.05f, 0.0f, 1.0f); break;
+                        case 4: op->pm_index = clampf_local(op->pm_index + delta * 0.05f, 0.0f, 2.0f); break;
+                        case 5: op->feedback = clampf_local(op->feedback + delta * 0.05f, 0.0f, 1.0f); break;
+                        case 6: op->velocity_sens = clampf_local(op->velocity_sens + delta * 0.05f, 0.0f, 1.0f); break;
+                        case 7: op->key_scaling = clampf_local(op->key_scaling + delta * 0.05f, 0.0f, 1.0f); break;
+                    }
+                    break;
+                }
+                case PAGE_OP1_ENV:
+                case PAGE_OP2_ENV:
+                case PAGE_OP3_ENV: {
+                    op_params_t *op = &g_synth.patch.op[current_op_index()];
+                    adsr_params_t *e = &op->env;
+                    switch (s_selected_row) {
+                        case 0: e->attack_ms = clampf_local(e->attack_ms + delta * 5.0f, 0.0f, 2000.0f); break;
+                        case 1: e->decay_ms = clampf_local(e->decay_ms + delta * 5.0f, 0.0f, 3000.0f); break;
+                        case 2: e->sustain_level = clampf_local(e->sustain_level + delta * 0.02f, 0.0f, 1.0f); break;
+                        case 3: e->release_ms = clampf_local(e->release_ms + delta * 5.0f, 0.0f, 3000.0f); break;
+                        case 4: op->velocity_sens = clampf_local(op->velocity_sens + delta * 0.05f, 0.0f, 1.0f); break;
+                        case 5: op->key_scaling = clampf_local(op->key_scaling + delta * 0.05f, 0.0f, 1.0f); break;
+                    }
+                    break;
+                }
+                case PAGE_FILTER: {
+                    filter_params_t *f = &g_synth.patch.filter;
+                    switch (s_selected_row) {
+                        case 0: f->cutoff_hz = clampf_local(f->cutoff_hz + delta * 100.0f, 20.0f, 20000.0f); break;
+                        case 1: f->resonance = clampf_local(f->resonance + delta * 0.1f, 0.5f, 10.0f); break;
+                        case 2: f->env_amount = clampf_local(f->env_amount + delta * 0.05f, -1.0f, 1.0f); break;
+                        case 3: { int v = (int)f->type + delta; if (v < 0) v = 2; if (v > 2) v = 0; f->type = (filter_type_t)v; break; }
+                        case 4: f->env.attack_ms = clampf_local(f->env.attack_ms + delta * 5.0f, 0.0f, 3000.0f); break;
+                        case 5: f->env.decay_ms = clampf_local(f->env.decay_ms + delta * 5.0f, 0.0f, 3000.0f); break;
+                        case 6: f->env.sustain_level = clampf_local(f->env.sustain_level + delta * 0.02f, 0.0f, 1.0f); break;
+                        case 7: f->env.release_ms = clampf_local(f->env.release_ms + delta * 5.0f, 0.0f, 3000.0f); break;
+                    }
+                    break;
+                }
+                case PAGE_LFO: {
+                    if (s_selected_row == 8) {
+                        g_synth.patch.glide_ms = clampf_local(g_synth.patch.glide_ms + delta * 10.0f, 0.0f, 1000.0f);
+                        break;
+                    }
+                    lfo_params_t *l = s_selected_row < 4 ? &g_synth.patch.lfo1 : &g_synth.patch.lfo2;
+                    int sub = s_selected_row < 4 ? s_selected_row : s_selected_row - 4;
+                    if (sub == 0) { int v = (int)l->waveform + delta; if (v < 0) v = WAVE_COUNT - 1; if (v >= WAVE_COUNT) v = 0; l->waveform = (waveform_t)v; }
+                    else if (sub == 1) l->rate_hz = clampf_local(l->rate_hz + delta * 0.1f, 0.05f, 20.0f);
+                    else if (sub == 2) l->depth = clampf_local(l->depth + delta * 0.02f, 0.0f, 1.0f);
+                    else { int v = (int)l->destination + delta; if (v < 0) v = 3; if (v > 3) v = 0; l->destination = (lfo_dest_t)v; }
+                    break;
+                }
+                default:
+                    break;
+            }
+            if (reset_scene) synth_scene_reset_locked();
+            synth_patch_unlock();
+            break;
+        }
+    }
+    s_ui_dirty = true;
+}
+
+void ui_menu_init(void)
+{
+    s_current_page = PAGE_DASHBOARD;
+    s_selected_row = 0;
+    s_edit_mode = false;
+    s_preset_mode = false;
+    s_enc_state = 0;
+    s_enc_accum = 0;
+    s_ui_dirty = true;
+}
+
+void ui_task(void *pvParameters)
+{
+    (void)pvParameters;
+    ESP_LOGI(TAG, "UI & Display Task running on Core %d", xPortGetCoreID());
+    sh1106_init();
+    gpio_config_t io_conf = {
+        .intr_type = GPIO_INTR_DISABLE,
+        .mode = GPIO_MODE_INPUT,
+        .pin_bit_mask = (1ULL << BTN_NAV_PREV_IO) | (1ULL << BTN_NAV_NEXT_IO) |
+                        (1ULL << ENCODER_PIN_CLK) | (1ULL << ENCODER_PIN_DT) |
+                        (1ULL << ENCODER_PIN_SW),
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&io_conf));
+
+    sh1106_clear();
+    sh1106_draw_string(14, 18, "ESP32-S3 FM SYNTH", true);
+    sh1106_draw_string(18, 30, "3-OP POLYPHONIC", true);
+    sh1106_draw_progress_bar(10, 46, 108, 10, 1.0f);
+    sh1106_flush();
+    vTaskDelay(pdMS_TO_TICKS(1200));
+
+    ui_menu_render();
+
+    int last_prev = 1, last_next = 1, last_sw = 1;
+    int initial_clk = gpio_get_level(ENCODER_PIN_CLK);
+    int initial_dt = gpio_get_level(ENCODER_PIN_DT);
+    s_enc_state = (uint8_t)((initial_clk << 1) | initial_dt);
+    s_enc_accum = 0;
+    TickType_t next_render = xTaskGetTickCount();
+    TickType_t sw_press_tick = 0;
+    bool long_sent = false;
+    const TickType_t long_press_ticks = pdMS_TO_TICKS(700);
+
+    while (1) {
+        int cur_prev = gpio_get_level(BTN_NAV_PREV_IO);
+        int cur_next = gpio_get_level(BTN_NAV_NEXT_IO);
+        int cur_sw = gpio_get_level(ENCODER_PIN_SW);
+        int cur_clk = gpio_get_level(ENCODER_PIN_CLK);
+        int cur_dt = gpio_get_level(ENCODER_PIN_DT);
+
+        if (last_prev == 1 && cur_prev == 0) {
+            ui_menu_handle_event((ui_event_t){.type = EVT_BTN_PREV});
+        }
+        if (last_next == 1 && cur_next == 0) {
+            ui_menu_handle_event((ui_event_t){.type = EVT_BTN_NEXT});
+        }
+
+        if (last_sw == 1 && cur_sw == 0) {
+            sw_press_tick = xTaskGetTickCount();
+            long_sent = false;
+        }
+        if (cur_sw == 0 && !long_sent && (xTaskGetTickCount() - sw_press_tick) >= long_press_ticks) {
+            ui_menu_handle_event((ui_event_t){.type = EVT_ENC_LONG});
+            long_sent = true;
+        }
+        if (last_sw == 0 && cur_sw == 1) {
+            if (!long_sent) ui_menu_handle_event((ui_event_t){.type = EVT_ENC_CLICK});
+        }
+
+        /* Full quadrature decoding. Poll fast enough to catch rapid turns and
+         * accumulate the four encoder transitions into one detent. */
+        static const int8_t qdec[16] = {
+             0, -1, +1,  0,
+            +1,  0,  0, -1,
+            -1,  0,  0, +1,
+             0, +1, -1,  0
+        };
+        uint8_t new_state = (uint8_t)((cur_clk << 1) | cur_dt);
+        uint8_t transition = (uint8_t)((s_enc_state << 2) | new_state);
+        s_enc_accum += qdec[transition];
+        s_enc_state = new_state;
+
+        while (s_enc_accum >= 4) {
+            ui_menu_handle_event((ui_event_t){.type = EVT_ENC_ROTATE_CW});
+            s_enc_accum -= 4;
+        }
+        while (s_enc_accum <= -4) {
+            ui_menu_handle_event((ui_event_t){.type = EVT_ENC_ROTATE_CCW});
+            s_enc_accum += 4;
+        }
+
+        last_prev = cur_prev;
+        last_next = cur_next;
+        last_sw = cur_sw;
+
+        /* OLED refresh is deliberately decoupled from encoder sampling.
+         * Rendering on every edge made fast rotation appear to be lost because
+         * the I2C display update blocked the polling loop. */
+        TickType_t now = xTaskGetTickCount();
+        if (s_ui_dirty && (int32_t)(now - next_render) >= 0) {
+            ui_menu_render();
+            s_ui_dirty = false;
+            next_render = now + pdMS_TO_TICKS(40);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+}

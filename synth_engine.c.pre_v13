@@ -1,0 +1,881 @@
+/**
+ * @file synth_engine.c
+ * @brief Optimized Phase Modulation (FM) Audio Synthesis Engine for ESP32-S3
+ *
+ * Implements 2048-LUT linear interpolation, 10 waveforms, 8 FM algorithms,
+ * a pure-sine diagnostic mode, stable TPT SVF filter, dual LFOs, voice allocation,
+ * and Core 1 audio output task.
+ */
+
+#include "synth_engine.h"
+#include "pin_config.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/portmacro.h"
+#include "driver/i2s_std.h"
+#include "esp_log.h"
+#include <math.h>
+#include <string.h>
+#include <stdlib.h>
+
+static const char *TAG = "SYNTH_DSP";
+
+#define PI_FLOAT (3.14159265358979323846f)
+#define TWO_PI_FLOAT (6.28318530717958647692f)
+
+synth_engine_t g_synth;
+static float s_sine_lut[SINE_LUT_SIZE];
+static i2s_chan_handle_t s_tx_chan = NULL;
+
+/*
+ * Voice control lock. MIDI/UI code can run on the other CPU while the audio
+ * task is updating the same voice structures. Note events are deliberately
+ * kept short inside this critical section: allocation and state transition
+ * are atomic, while the expensive DSP never runs with the lock held.
+ */
+static portMUX_TYPE s_voice_mux = portMUX_INITIALIZER_UNLOCKED;
+
+#define VOICE_POST_FILTER_PEAK  (0.50f)
+#define POLY_MIX_HEADROOM       (0.85f)
+#define FINAL_SAFETY_PEAK       (0.98f)
+#define MAX_OPERATOR_INCREMENT  (0.499f)
+
+/* --------------------------------------------------------------------------
+ * 1. SINE LUT GENERATION & INTERPOLATION
+ * -------------------------------------------------------------------------- */
+static void init_sine_lut(void) {
+    for (int i = 0; i < SINE_LUT_SIZE; i++) {
+        s_sine_lut[i] = sinf(((float)i / (float)SINE_LUT_SIZE) * TWO_PI_FLOAT);
+    }
+}
+
+static inline float lookup_sine(float phase) {
+    // Wrap phase to [0.0, 1.0)
+    phase = phase - floorf(phase);
+    if (phase < 0.0f) phase += 1.0f;
+
+    float idx_f = phase * (float)SINE_LUT_SIZE;
+    int idx0 = ((int)idx_f) & (SINE_LUT_SIZE - 1);
+    int idx1 = (idx0 + 1) & (SINE_LUT_SIZE - 1);
+    float frac = idx_f - (float)idx0;
+
+    // Linear interpolation
+    return s_sine_lut[idx0] + frac * (s_sine_lut[idx1] - s_sine_lut[idx0]);
+}
+
+/* --------------------------------------------------------------------------
+ * 2. WAVEFORM EVALUATOR (LUT + ANALYTICAL)
+ * -------------------------------------------------------------------------- */
+static inline float evaluate_waveform(waveform_t wave, float phase) {
+    phase = phase - floorf(phase);
+    if (phase < 0.0f) phase += 1.0f;
+
+    switch (wave) {
+        case WAVE_SINE:
+            return lookup_sine(phase);
+
+        case WAVE_TRIANGLE:
+            if (phase < 0.25f) return 4.0f * phase;
+            if (phase < 0.75f) return 2.0f - 4.0f * phase;
+            return 4.0f * phase - 4.0f;
+
+        case WAVE_SAW:
+            return 2.0f * phase - 1.0f;
+
+        case WAVE_SQUARE:
+            return phase < 0.5f ? 1.0f : -1.0f;
+
+        case WAVE_PULSE25:
+            return phase < 0.25f ? 1.0f : -1.0f;
+
+        case WAVE_HALF_SINE: { // TX81Z W2
+            float s = lookup_sine(phase);
+            return s > 0.0f ? s : 0.0f;
+        }
+
+        case WAVE_ABS_SINE: // TX81Z W3
+            return fabsf(lookup_sine(phase));
+
+        case WAVE_DOUBLE_SINE: // TX81Z W4
+            return phase < 0.5f ? lookup_sine(phase * 2.0f) : 0.0f;
+
+        case WAVE_FORMANT: {
+            float carrier = lookup_sine(phase * 3.0f);
+            float window = 0.5f - 0.5f * lookup_sine(phase + 0.25f);
+            return carrier * window * 2.0f;
+        }
+
+        case WAVE_NOISE:
+            return ((float)rand() / (float)RAND_MAX) * 2.0f - 1.0f;
+
+        default:
+            return lookup_sine(phase);
+    }
+}
+
+/* --------------------------------------------------------------------------
+ * 3. ADSR ENVELOPE CALCULATION
+ * -------------------------------------------------------------------------- */
+static void env_trigger(adsr_state_t *env, const adsr_params_t *p, float velocity) {
+    env->stage = ENV_ATTACK;
+    env->current_level = 0.0f;
+    env->target_sustain = fmaxf(0.0f, fminf(1.0f, p->sustain_level)) * velocity;
+
+    float attack_samples = fmaxf(1.0f, (p->attack_ms / 1000.0f) * (float)SYNTH_SAMPLE_RATE);
+    env->attack_step = 1.0f / attack_samples;
+
+    float decay_samples = fmaxf(1.0f, (p->decay_ms / 1000.0f) * (float)SYNTH_SAMPLE_RATE);
+    env->decay_factor = powf(0.001f, 1.0f / decay_samples);
+}
+
+static void env_release(adsr_state_t *env, const adsr_params_t *p) {
+    if (env->stage == ENV_IDLE) return;
+    env->stage = ENV_RELEASE;
+    float release_samples = fmaxf(1.0f, (p->release_ms / 1000.0f) * (float)SYNTH_SAMPLE_RATE);
+    env->release_factor = powf(0.001f, 1.0f / release_samples);
+}
+
+static inline float env_process(adsr_state_t *env) {
+    switch (env->stage) {
+        case ENV_IDLE:
+            env->current_level = 0.0f;
+            break;
+        case ENV_ATTACK:
+            env->current_level += env->attack_step;
+            if (env->current_level >= 1.0f) {
+                env->current_level = 1.0f;
+                env->stage = ENV_DECAY;
+            }
+            break;
+        case ENV_DECAY:
+            env->current_level = env->target_sustain + 
+                (env->current_level - env->target_sustain) * env->decay_factor;
+            if (fabsf(env->current_level - env->target_sustain) < 0.0005f) {
+                env->current_level = env->target_sustain;
+                env->stage = ENV_SUSTAIN;
+            }
+            break;
+        case ENV_SUSTAIN:
+            env->current_level = env->target_sustain;
+            break;
+        case ENV_RELEASE:
+            env->current_level *= env->release_factor;
+            if (env->current_level < 0.0005f) {
+                env->current_level = 0.0f;
+                env->stage = ENV_IDLE;
+            }
+            break;
+    }
+    return env->current_level;
+}
+
+/* --------------------------------------------------------------------------
+ * 4. STATE VARIABLE FILTER (SVF)
+ * -------------------------------------------------------------------------- */
+static inline float svf_process(synth_voice_t *v, float input, float cutoff, float resonance, filter_type_t type) {
+    /*
+     * Topology-Preserving Transform (TPT) state-variable filter.
+     *
+     * The old Chamberlin-style integrator became unstable at high cutoff
+     * frequencies because its coefficient was allowed to approach 2.0.
+     * TPT uses tan(pi*fc/fs), so the integrator remains well behaved all
+     * the way to the Nyquist limit (we still clamp to 0.45*Fs here).
+     *
+     * resonance is kept as a user-facing Q-like control. k = 1/Q.
+     */
+    const float max_cutoff = (float)SYNTH_SAMPLE_RATE * 0.45f;
+    cutoff = fmaxf(20.0f, fminf(max_cutoff, cutoff));
+    resonance = fmaxf(0.5f, fminf(10.0f, resonance));
+
+    const float g = tanf(PI_FLOAT * cutoff / (float)SYNTH_SAMPLE_RATE);
+    const float k = 1.0f / resonance;
+    const float a1 = 1.0f / (1.0f + g * (g + k));
+
+    const float v3 = input - v->svf_ic2;
+    const float v1 = (g * v3 + v->svf_ic1) * a1;
+    const float v2 = v->svf_ic2 + g * v1;
+
+    v->svf_ic1 = 2.0f * v1 - v->svf_ic1;
+    v->svf_ic2 = 2.0f * v2 - v->svf_ic2;
+
+    const float low = v2;
+    const float band = v1;
+    const float high = input - k * band - low;
+
+    switch (type) {
+        case FILTER_HIGHPASS: return high;
+        case FILTER_BANDPASS: return band;
+        case FILTER_LOWPASS:
+        default: return low;
+    }
+}
+
+/* --------------------------------------------------------------------------
+ * 5. INIT & PATCH LOADING
+ * -------------------------------------------------------------------------- */
+void synth_engine_init(void) {
+    memset(&g_synth, 0, sizeof(g_synth));
+    init_sine_lut();
+
+    // Default factory patch (DX E-Piano style)
+    synth_patch_t *p = &g_synth.patch;
+    strncpy(p->name, "DX E-Piano 80s", sizeof(p->name) - 1);
+    p->algorithm = 1; // (2+3)->1
+    p->master_volume = 0.85f;
+    p->glide_ms = 0.0f;
+    p->polyphony = 8;
+
+    // Op1 (Carrier)
+    p->op[0].waveform = WAVE_SINE;
+    p->op[0].ratio = 1.0f;
+    p->op[0].level = 0.9f;
+    p->op[0].velocity_sens = 0.7f;
+    p->op[0].env.attack_ms = 2.0f;
+    p->op[0].env.decay_ms = 1800.0f;
+    p->op[0].env.sustain_level = 0.15f;
+    p->op[0].env.release_ms = 600.0f;
+
+    // Op2 (Modulator)
+    p->op[1].waveform = WAVE_SINE;
+    p->op[1].ratio = 14.0f;
+    p->op[1].detune_cents = 3.0f;
+    p->op[1].level = 0.75f;
+    p->op[1].velocity_sens = 0.85f;
+    p->op[1].env.attack_ms = 2.0f;
+    p->op[1].env.decay_ms = 350.0f;
+    p->op[1].env.sustain_level = 0.0f;
+    p->op[1].env.release_ms = 250.0f;
+
+    // Op3 (Modulator with feedback)
+    p->op[2].waveform = WAVE_HALF_SINE;
+    p->op[2].ratio = 1.0f;
+    p->op[2].detune_cents = -4.0f;
+    p->op[2].level = 0.65f;
+    p->op[2].feedback = 0.3f;
+    p->op[2].velocity_sens = 0.8f;
+    p->op[2].env.attack_ms = 2.0f;
+    p->op[2].env.decay_ms = 900.0f;
+    p->op[2].env.sustain_level = 0.05f;
+    p->op[2].env.release_ms = 450.0f;
+
+    // Filter
+    p->filter.type = FILTER_LOWPASS;
+    p->filter.cutoff_hz = 14000.0f;
+    p->filter.resonance = 1.2f;
+    p->filter.env_amount = 0.25f;
+    p->filter.env.attack_ms = 5.0f;
+    p->filter.env.decay_ms = 1500.0f;
+    p->filter.env.sustain_level = 0.4f;
+    p->filter.env.release_ms = 500.0f;
+
+    // LFOs
+    p->lfo1.waveform = WAVE_TRIANGLE;
+    p->lfo1.rate_hz = 4.5f;
+    p->lfo1.depth = 0.08f;
+    p->lfo1.destination = LFO_DEST_PITCH;
+
+    p->lfo2.waveform = WAVE_SINE;
+    p->lfo2.rate_hz = 0.8f;
+    p->lfo2.depth = 0.15f;
+    p->lfo2.destination = LFO_DEST_AMP;
+
+    ESP_LOGI(TAG, "DSP Synth Engine initialized successfully");
+}
+
+void synth_load_patch(const synth_patch_t *patch) {
+    if (patch) {
+        memcpy(&g_synth.patch, patch, sizeof(synth_patch_t));
+    }
+}
+
+/* --------------------------------------------------------------------------
+ * 6. VOICE ALLOCATION & MIDI CONTROL
+ * -------------------------------------------------------------------------- */
+static void synth_note_off_locked(uint8_t note);
+
+static void synth_note_on_locked(uint8_t note, uint8_t velocity) {
+    if (velocity == 0) {
+        synth_note_off_locked(note);
+        return;
+    }
+
+    uint8_t limit = g_synth.patch.polyphony;
+    if (limit == 0) limit = 1;
+    if (limit > SYNTH_MAX_VOICES) limit = SYNTH_MAX_VOICES;
+
+    // 1. Look for free inactive voice
+    synth_voice_t *target = NULL;
+    for (int i = 0; i < limit; i++) {
+        if (!g_synth.voices[i].active) {
+            target = &g_synth.voices[i];
+            break;
+        }
+    }
+
+    // 2. Look for matching note
+    if (!target) {
+        for (int i = 0; i < limit; i++) {
+            if (g_synth.voices[i].midi_note == note) {
+                target = &g_synth.voices[i];
+                break;
+            }
+        }
+    }
+
+    // 3. Oldest voice stealing
+    if (!target) {
+        uint32_t oldest_age = 0;
+        for (int i = 0; i < limit; i++) {
+            if (g_synth.voices[i].age > oldest_age) {
+                oldest_age = g_synth.voices[i].age;
+                target = &g_synth.voices[i];
+            }
+        }
+    }
+
+    if (!target) return;
+
+    /*
+     * Retriggering an already sounding voice by hard-resetting phase/filter
+     * state creates an instantaneous waveform discontinuity (an audible click).
+     * This is especially obvious with rapid note changes and polyphony=1.
+     * Keep the oscillator phase, feedback and filter state when reusing an
+     * active voice; only the pitch/envelopes are retriggered.
+     */
+    const bool was_active = target->active;
+
+    target->active = true;
+    target->midi_note = note;
+    target->velocity = (float)velocity / 127.0f;
+    target->age = 0;
+    target->target_freq = 440.0f * powf(2.0f, ((float)note - 69.0f) / 12.0f);
+
+    if (!was_active) {
+        target->current_freq = target->target_freq;
+        target->phase[0] = 0.0f;
+        target->phase[1] = 0.0f;
+        target->phase[2] = 0.0f;
+        target->fb[0] = 0.0f;
+        target->fb[1] = 0.0f;
+        target->fb[2] = 0.0f;
+        target->svf_ic1 = 0.0f;
+        target->svf_ic2 = 0.0f;
+    } else if (g_synth.patch.glide_ms <= 0.0f) {
+        target->current_freq = target->target_freq;
+    }
+
+    // Trigger envelopes. On a live voice, ramp from the current level instead
+    // of jumping to zero, which removes the main source of retrigger clicks.
+    for (int i = 0; i < 3; i++) {
+        float vel_scale = 1.0f - g_synth.patch.op[i].velocity_sens * (1.0f - target->velocity);
+        if (was_active) {
+            float start = target->env[i].current_level;
+            float attack_samples = fmaxf(1.0f, (g_synth.patch.op[i].env.attack_ms / 1000.0f) * (float)SYNTH_SAMPLE_RATE);
+            target->env[i].stage = ENV_ATTACK;
+            target->env[i].attack_step = fmaxf(0.000001f, (1.0f - start) / attack_samples);
+            target->env[i].current_level = fmaxf(0.0f, fminf(1.0f, start));
+            target->env[i].target_sustain = fmaxf(0.0f, fminf(1.0f, g_synth.patch.op[i].env.sustain_level)) * vel_scale;
+            float decay_samples = fmaxf(1.0f, (g_synth.patch.op[i].env.decay_ms / 1000.0f) * (float)SYNTH_SAMPLE_RATE);
+            target->env[i].decay_factor = powf(0.001f, 1.0f / decay_samples);
+        } else {
+            env_trigger(&target->env[i], &g_synth.patch.op[i].env, vel_scale);
+        }
+    }
+    if (was_active) {
+        float start = target->filter_env.current_level;
+        float attack_samples = fmaxf(1.0f, (g_synth.patch.filter.env.attack_ms / 1000.0f) * (float)SYNTH_SAMPLE_RATE);
+        target->filter_env.stage = ENV_ATTACK;
+        target->filter_env.attack_step = fmaxf(0.000001f, (1.0f - start) / attack_samples);
+        target->filter_env.current_level = fmaxf(0.0f, fminf(1.0f, start));
+        target->filter_env.target_sustain = fmaxf(0.0f, fminf(1.0f, g_synth.patch.filter.env.sustain_level));
+        float decay_samples = fmaxf(1.0f, (g_synth.patch.filter.env.decay_ms / 1000.0f) * (float)SYNTH_SAMPLE_RATE);
+        target->filter_env.decay_factor = powf(0.001f, 1.0f / decay_samples);
+    } else {
+        env_trigger(&target->filter_env, &g_synth.patch.filter.env, 1.0f);
+    }
+}
+
+static void synth_note_off_locked(uint8_t note) {
+    for (int i = 0; i < SYNTH_MAX_VOICES; i++) {
+        synth_voice_t *v = &g_synth.voices[i];
+        if (v->active && v->midi_note == note) {
+            for (int op = 0; op < 3; op++) {
+                env_release(&v->env[op], &g_synth.patch.op[op].env);
+            }
+            env_release(&v->filter_env, &g_synth.patch.filter.env);
+        }
+    }
+}
+
+static void synth_all_notes_off_locked(void) {
+    for (int i = 0; i < SYNTH_MAX_VOICES; i++) {
+        synth_voice_t *v = &g_synth.voices[i];
+        if (v->active) {
+            for (int op = 0; op < 3; op++) {
+                env_release(&v->env[op], &g_synth.patch.op[op].env);
+            }
+            env_release(&v->filter_env, &g_synth.patch.filter.env);
+        }
+    }
+}
+
+void synth_note_on(uint8_t note, uint8_t velocity) {
+    portENTER_CRITICAL(&s_voice_mux);
+    synth_note_on_locked(note, velocity);
+    portEXIT_CRITICAL(&s_voice_mux);
+}
+
+void synth_note_off(uint8_t note) {
+    portENTER_CRITICAL(&s_voice_mux);
+    synth_note_off_locked(note);
+    portEXIT_CRITICAL(&s_voice_mux);
+}
+
+void synth_all_notes_off(void) {
+    portENTER_CRITICAL(&s_voice_mux);
+    synth_all_notes_off_locked();
+    portEXIT_CRITICAL(&s_voice_mux);
+}
+
+void synth_set_pitch_bend(int16_t bend_raw) {
+    // 0..8192..16383 -> -2.0 to +2.0 semitones
+    g_synth.pitch_bend = ((float)(bend_raw - 8192) / 8192.0f) * 2.0f;
+}
+
+void synth_set_mod_wheel(uint8_t val) {
+    g_synth.mod_wheel = (float)val / 127.0f;
+}
+
+void synth_set_cc(uint8_t cc_num, uint8_t val) {
+    float norm = (float)val / 127.0f;
+    switch (cc_num) {
+        case 1:  // Mod Wheel
+            synth_set_mod_wheel(val);
+            break;
+        case 7:  // Master Volume
+            g_synth.patch.master_volume = norm;
+            break;
+        case 74: // Cutoff
+            g_synth.patch.filter.cutoff_hz = 20.0f + norm * norm * 18000.0f;
+            break;
+        case 71: // Resonance
+            g_synth.patch.filter.resonance = 0.5f + norm * 8.0f;
+            break;
+        case 123: // All Notes Off
+            synth_all_notes_off();
+            break;
+        default:
+            break;
+    }
+}
+
+/* --------------------------------------------------------------------------
+ * 7. CORE 1 REAL-TIME AUDIO SYNTHESIS TASK & I2S OUTPUT
+ * -------------------------------------------------------------------------- */
+static void init_i2s_pcm5102a(void) {
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    chan_cfg.dma_desc_num = 6;
+    chan_cfg.dma_frame_num = SYNTH_DMA_BUFFER_SIZE;
+    ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &s_tx_chan, NULL));
+
+    i2s_std_config_t std_cfg = {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SYNTH_SAMPLE_RATE),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED,
+            .bclk = I2S_BCK_IO,
+            .ws   = I2S_WS_IO,
+            .dout = I2S_DATA_OUT_IO,
+            .din  = I2S_DATA_IN_IO,
+            .invert_flags = {
+                .mclk_inv = false,
+                .bclk_inv = false,
+                .ws_inv   = false,
+            },
+        },
+    };
+
+    ESP_ERROR_CHECK(i2s_channel_init_std_mode(s_tx_chan, &std_cfg));
+    ESP_ERROR_CHECK(i2s_channel_enable(s_tx_chan));
+    ESP_LOGI(TAG, "PCM5102A I2S initialized on BCK=%d, WS=%d, DATA=%d", 
+             I2S_BCK_IO, I2S_WS_IO, I2S_DATA_OUT_IO);
+}
+
+void synth_audio_task(void *pvParameters) {
+    (void)pvParameters;
+    ESP_LOGI(TAG, "Audio Synthesis Task running on Core %d", xPortGetCoreID());
+    init_i2s_pcm5102a();
+
+    int16_t dma_stereo_buffer[SYNTH_DMA_BUFFER_SIZE * 2];
+    size_t bytes_written = 0;
+
+    const float sample_rate_f = (float)SYNTH_SAMPLE_RATE;
+
+    while (1) {
+        synth_patch_t *patch = &g_synth.patch;
+
+        /* Cache detune multipliers once per audio block. Detune is a static
+         * frequency ratio in cents; calculating powf() for every operator of
+         * every voice on every sample wastes a large amount of CPU and makes
+         * parameter editing unnecessarily fragile in the real-time path. */
+        const float detune_mul[3] = {
+            powf(2.0f, patch->op[0].detune_cents / 1200.0f),
+            powf(2.0f, patch->op[1].detune_cents / 1200.0f),
+            powf(2.0f, patch->op[2].detune_cents / 1200.0f)
+        };
+
+        float lfo1_inc = patch->lfo1.rate_hz / sample_rate_f;
+        float lfo2_inc = patch->lfo2.rate_hz / sample_rate_f;
+
+        // Pitch bend ratio
+        float pitch_bend_ratio = powf(2.0f, g_synth.pitch_bend / 12.0f);
+        uint8_t active_count = 0;
+
+        for (int s = 0; s < SYNTH_DMA_BUFFER_SIZE; s++) {
+            // LFO evaluation
+            float lfo1_val = evaluate_waveform(patch->lfo1.waveform, g_synth.lfo1_phase);
+            float lfo2_val = evaluate_waveform(patch->lfo2.waveform, g_synth.lfo2_phase);
+
+            g_synth.lfo1_phase += lfo1_inc;
+            if (g_synth.lfo1_phase >= 1.0f) g_synth.lfo1_phase -= 1.0f;
+
+            g_synth.lfo2_phase += lfo2_inc;
+            if (g_synth.lfo2_phase >= 1.0f) g_synth.lfo2_phase -= 1.0f;
+
+            // LFO & Mod Wheel destination modulation
+            float pitch_mod = pitch_bend_ratio;
+            float cutoff_mod = 0.0f;
+            float fm_mod = 0.0f;
+            float amp_mod = 0.0f;
+
+            // LFO1 depth can be increased by the mod wheel. LFO2 is independent.
+            const float lfo1_depth = fmaxf(0.0f, fminf(1.0f,
+                fmaxf(patch->lfo1.depth, g_synth.mod_wheel * 0.8f)));
+            const float lfo2_depth = fmaxf(0.0f, fminf(1.0f, patch->lfo2.depth));
+
+            switch (patch->lfo1.destination) {
+                case LFO_DEST_PITCH:
+                    pitch_mod *= powf(2.0f, (lfo1_val * lfo1_depth * 1.5f) / 12.0f);
+                    break;
+                case LFO_DEST_CUTOFF:
+                    cutoff_mod += lfo1_val * lfo1_depth;
+                    break;
+                case LFO_DEST_FM_INDEX:
+                    fm_mod += lfo1_val * lfo1_depth;
+                    break;
+                case LFO_DEST_AMP:
+                    amp_mod += lfo1_val * lfo1_depth * 0.5f;
+                    break;
+            }
+
+            switch (patch->lfo2.destination) {
+                case LFO_DEST_PITCH:
+                    pitch_mod *= powf(2.0f, (lfo2_val * lfo2_depth * 1.5f) / 12.0f);
+                    break;
+                case LFO_DEST_CUTOFF:
+                    cutoff_mod += lfo2_val * lfo2_depth;
+                    break;
+                case LFO_DEST_FM_INDEX:
+                    fm_mod += lfo2_val * lfo2_depth;
+                    break;
+                case LFO_DEST_AMP:
+                    amp_mod += lfo2_val * lfo2_depth * 0.5f;
+                    break;
+            }
+
+            float sample_mix = 0.0f;
+            uint8_t current_active = 0;
+            uint8_t limit = patch->polyphony;
+            if (limit == 0) limit = 1;
+            if (limit > SYNTH_MAX_VOICES) limit = SYNTH_MAX_VOICES;
+
+            for (int v = 0; v < limit; v++) {
+                synth_voice_t *voice = &g_synth.voices[v];
+
+                /* Snapshot the activation state atomically. The critical
+                 * section is intentionally only the control/state handoff;
+                 * the expensive oscillator/filter DSP remains unlocked. */
+                portENTER_CRITICAL(&s_voice_mux);
+                bool voice_active = voice->active;
+                uint8_t voice_note = voice->midi_note;
+                if (voice_active) {
+                    current_active++;
+                    voice->age++;
+                }
+                portEXIT_CRITICAL(&s_voice_mux);
+                if (!voice_active) continue;
+
+                // Glide / pitch state is also shared with Note On.
+                float voice_freq;
+                portENTER_CRITICAL(&s_voice_mux);
+                if (patch->glide_ms > 0.0f && voice->current_freq != voice->target_freq) {
+                    float step = 1.0f / ((patch->glide_ms / 1000.0f) * sample_rate_f);
+                    voice->current_freq += (voice->target_freq - voice->current_freq) * fminf(1.0f, step * 4.0f);
+                } else {
+                    voice->current_freq = voice->target_freq;
+                }
+                voice_freq = voice->current_freq;
+                portEXIT_CRITICAL(&s_voice_mux);
+
+                /* Process ADSR atomically with Note Off. The critical
+                 * section is deliberately limited to the four envelope state
+                 * updates, not the oscillator/filter DSP. */
+                float e1, e2, e3, f_env;
+                bool became_idle;
+                portENTER_CRITICAL(&s_voice_mux);
+                e1 = env_process(&voice->env[0]);
+                e2 = env_process(&voice->env[1]);
+                e3 = env_process(&voice->env[2]);
+                f_env = env_process(&voice->filter_env);
+                became_idle = (voice->env[0].stage == ENV_IDLE &&
+                               voice->env[1].stage == ENV_IDLE &&
+                               voice->env[2].stage == ENV_IDLE);
+                if (became_idle) {
+                    voice->active = false;
+                }
+                portEXIT_CRITICAL(&s_voice_mux);
+                if (became_idle) continue;
+
+                float base_freq = voice_freq * pitch_mod;
+
+                // Operator frequencies: ratio * detune(cents).
+                // Cents are converted to a frequency multiplier, not added
+                // to phase or FM index. This keeps detune strictly a pitch
+                // parameter. Keep each increment below Nyquist in the
+                // oscillator core; otherwise extreme ratio/high-note patches
+                // can alias so aggressively that they sound like instability.
+                float inc1 = (base_freq * patch->op[0].ratio * detune_mul[0]) / sample_rate_f;
+                float inc2 = (base_freq * patch->op[1].ratio * detune_mul[1]) / sample_rate_f;
+                float inc3 = (base_freq * patch->op[2].ratio * detune_mul[2]) / sample_rate_f;
+                inc1 = fminf(fmaxf(0.0f, inc1), MAX_OPERATOR_INCREMENT);
+                inc2 = fminf(fmaxf(0.0f, inc2), MAX_OPERATOR_INCREMENT);
+                inc3 = fminf(fmaxf(0.0f, inc3), MAX_OPERATOR_INCREMENT);
+
+                /* Key scaling: 0% = flat response, 100% gives a useful
+                 * positive level slope across the keyboard (MIDI 60 is neutral). */
+                float key_position = ((float)voice_note - 60.0f) / 60.0f;
+                float key_scale[3];
+                for (int k = 0; k < 3; ++k) {
+                    key_scale[k] = fmaxf(0.25f, fminf(1.75f, 1.0f + patch->op[k].key_scaling * key_position));
+                }
+
+                float voice_out = 0.0f;
+                /*
+                 * Operator level remains the audible level for carriers and
+                 * the base PM index for modulators. One unit of level now
+                 * means one full cycle of phase deviation, instead of the
+                 * previous hard-coded 2-cycle modulation. LFO FM_INDEX
+                 * scales the index symmetrically around 1.0.
+                 */
+                const float fm_lfo_scale = fmaxf(0.0f, 1.0f + fm_mod);
+                const float pm2 = patch->op[1].level * fm_lfo_scale;
+                const float pm3 = patch->op[2].level * fm_lfo_scale;
+
+                // Phase Modulation Algorithms + diagnostic single-operator mode
+                switch (patch->algorithm) {
+                    case 0: { // 3 -> 2 -> 1
+                        float op3 = evaluate_waveform(patch->op[2].waveform, voice->phase[2]) * key_scale[2] * e3;
+                        float op2 = evaluate_waveform(patch->op[1].waveform, voice->phase[1] + op3 * pm3) * key_scale[1] * e2;
+                        float op1 = evaluate_waveform(patch->op[0].waveform, voice->phase[0] + op2 * pm2) * patch->op[0].level * key_scale[0] * e1;
+                        voice_out = op1;
+                        break;
+                    }
+                    case 1: { // (2 + 3) -> 1
+                        float op3 = evaluate_waveform(patch->op[2].waveform, voice->phase[2]) * key_scale[2] * e3;
+                        float op2 = evaluate_waveform(patch->op[1].waveform, voice->phase[1]) * key_scale[1] * e2;
+                        float op1 = evaluate_waveform(patch->op[0].waveform, voice->phase[0] + op2 * pm2 + op3 * pm3) * patch->op[0].level * key_scale[0] * e1;
+                        voice_out = op1;
+                        break;
+                    }
+                    case 2: { // 3 -> (1 + 2)
+                        float op3 = evaluate_waveform(patch->op[2].waveform, voice->phase[2]) * key_scale[2] * e3;
+                        float op1 = evaluate_waveform(patch->op[0].waveform, voice->phase[0] + op3 * pm3) * patch->op[0].level * key_scale[0] * e1;
+                        float op2 = evaluate_waveform(patch->op[1].waveform, voice->phase[1] + op3 * pm3) * patch->op[1].level * key_scale[1] * e2;
+                        voice_out = (op1 + op2) * 0.5f;
+                        break;
+                    }
+                    case 3: { // (3 -> 2) + 1
+                        float op3 = evaluate_waveform(patch->op[2].waveform, voice->phase[2]) * key_scale[2] * e3;
+                        float op2 = evaluate_waveform(patch->op[1].waveform, voice->phase[1] + op3 * pm3) * patch->op[1].level * key_scale[1] * e2;
+                        float op1 = evaluate_waveform(patch->op[0].waveform, voice->phase[0]) * patch->op[0].level * key_scale[0] * e1;
+                        voice_out = (op1 + op2) * 0.5f;
+                        break;
+                    }
+                    case 4: { // 1 + 2 + 3 Additive
+                        float op1 = evaluate_waveform(patch->op[0].waveform, voice->phase[0]) * patch->op[0].level * key_scale[0] * e1;
+                        float op2 = evaluate_waveform(patch->op[1].waveform, voice->phase[1]) * patch->op[1].level * key_scale[1] * e2;
+                        float op3 = evaluate_waveform(patch->op[2].waveform, voice->phase[2]) * patch->op[2].level * key_scale[2] * e3;
+                        voice_out = (op1 + op2 + op3) * 0.3333333f;
+                        break;
+                    }
+                    case 5: { // (3*) -> 2 -> 1 (Op3 self-feedback)
+                        float op3_phase = voice->phase[2] + voice->fb[2] * patch->op[2].feedback * 0.75f;
+                        float op3 = evaluate_waveform(patch->op[2].waveform, op3_phase) * key_scale[2] * e3;
+                        voice->fb[2] = op3;
+
+                        float op2 = evaluate_waveform(patch->op[1].waveform, voice->phase[1] + op3 * pm3) * key_scale[1] * e2;
+                        float op1 = evaluate_waveform(patch->op[0].waveform, voice->phase[0] + op2 * pm2) * patch->op[0].level * key_scale[0] * e1;
+                        voice_out = op1;
+                        break;
+                    }
+                    case 6: { // 3 -> (2*) -> 1 (Op2 self-feedback)
+                        float op3 = evaluate_waveform(patch->op[2].waveform, voice->phase[2]) * key_scale[2] * e3;
+                        float op2_phase = voice->phase[1] + op3 * pm3 + voice->fb[1] * patch->op[1].feedback * 0.75f;
+                        float op2 = evaluate_waveform(patch->op[1].waveform, op2_phase) * key_scale[1] * e2;
+                        voice->fb[1] = op2;
+
+                        float op1 = evaluate_waveform(patch->op[0].waveform, voice->phase[0] + op2 * pm2) * patch->op[0].level * key_scale[0] * e1;
+                        voice_out = op1;
+                        break;
+                    }
+                    case 7: { // 3 -> 2 -> (1*) (Op1 carrier feedback)
+                        float op3 = evaluate_waveform(patch->op[2].waveform, voice->phase[2]) * key_scale[2] * e3;
+                        float op2 = evaluate_waveform(patch->op[1].waveform, voice->phase[1] + op3 * pm3) * key_scale[1] * e2;
+                        float op1_phase = voice->phase[0] + op2 * pm2 + voice->fb[0] * patch->op[0].feedback * 0.75f;
+                        float op1 = evaluate_waveform(patch->op[0].waveform, op1_phase) * patch->op[0].level * key_scale[0] * e1;
+                        voice->fb[0] = op1;
+                        voice_out = op1;
+                        break;
+                    }
+                    case 8: { // PURE OP1: no operator summing, no PM/FM feedback
+                        voice_out = evaluate_waveform(WAVE_SINE, voice->phase[0])
+                                  * patch->op[0].level * key_scale[0] * e1;
+                        break;
+                    }
+                    case 9: { // DIAG: pure sine through filter only
+                        voice_out = evaluate_waveform(WAVE_SINE, voice->phase[0])
+                                  * patch->op[0].level * key_scale[0] * e1;
+                        break;
+                    }
+                    case 10: { // DIAG: pure sine + amplitude LFO only
+                        voice_out = evaluate_waveform(WAVE_SINE, voice->phase[0])
+                                  * patch->op[0].level * key_scale[0] * e1;
+                        break;
+                    }
+                    case 11: { // DIAG: pure sine + pitch LFO only
+                        voice_out = evaluate_waveform(WAVE_SINE, voice->phase[0])
+                                  * patch->op[0].level * key_scale[0] * e1;
+                        break;
+                    }
+                    case 12: { // DIAG: two sine carriers, no PM
+                        float op1 = evaluate_waveform(WAVE_SINE, voice->phase[0]) * patch->op[0].level * key_scale[0] * e1;
+                        float op2 = evaluate_waveform(WAVE_SINE, voice->phase[1]) * patch->op[1].level * key_scale[1] * e2;
+                        voice_out = (op1 + op2) * 0.5f;
+                        break;
+                    }
+                    case 13: { // DIAG: three sine carriers, no PM
+                        float op1 = evaluate_waveform(WAVE_SINE, voice->phase[0]) * patch->op[0].level * key_scale[0] * e1;
+                        float op2 = evaluate_waveform(WAVE_SINE, voice->phase[1]) * patch->op[1].level * key_scale[1] * e2;
+                        float op3 = evaluate_waveform(WAVE_SINE, voice->phase[2]) * patch->op[2].level * key_scale[2] * e3;
+                        voice_out = (op1 + op2 + op3) * 0.3333333f;
+                        break;
+                    }
+                    case 14: { // DIAG: 2 -> 1, moderate PM
+                        float op2 = evaluate_waveform(WAVE_SINE, voice->phase[1]) * key_scale[1] * e2;
+                        float op1 = evaluate_waveform(WAVE_SINE, voice->phase[0] + op2 * pm2) * patch->op[0].level * key_scale[0] * e1;
+                        voice_out = op1;
+                        break;
+                    }
+                    case 15: { // DIAG: (2 + 3) -> 1, moderate PM
+                        float op2 = evaluate_waveform(WAVE_SINE, voice->phase[1]) * key_scale[1] * e2;
+                        float op3 = evaluate_waveform(WAVE_SINE, voice->phase[2]) * key_scale[2] * e3;
+                        float op1 = evaluate_waveform(WAVE_SINE, voice->phase[0] + op2 * pm2 + op3 * pm3) * patch->op[0].level * key_scale[0] * e1;
+                        voice_out = op1;
+                        break;
+                    }
+                    case 16: { // DIAG: 3 -> 2 -> 1, moderate PM
+                        float op3 = evaluate_waveform(WAVE_SINE, voice->phase[2]) * key_scale[2] * e3;
+                        float op2 = evaluate_waveform(WAVE_SINE, voice->phase[1] + op3 * pm3) * key_scale[1] * e2;
+                        float op1 = evaluate_waveform(WAVE_SINE, voice->phase[0] + op2 * pm2) * patch->op[0].level * key_scale[0] * e1;
+                        voice_out = op1;
+                        break;
+                    }
+                    case 17: { // DIAG: 3 -> 2 with Op2 feedback -> 1
+                        float op3 = evaluate_waveform(WAVE_SINE, voice->phase[2]) * key_scale[2] * e3;
+                        float op2_phase = voice->phase[1] + op3 * pm3 + voice->fb[1] * patch->op[1].feedback * 0.75f;
+                        float op2 = evaluate_waveform(WAVE_SINE, op2_phase) * key_scale[1] * e2;
+                        voice->fb[1] = op2;
+                        float op1 = evaluate_waveform(WAVE_SINE, voice->phase[0] + op2 * pm2) * patch->op[0].level * key_scale[0] * e1;
+                        voice_out = op1;
+                        break;
+                    }
+                    case 18: { // DIAG: 2 -> 1 with FM index LFO
+                        float op2 = evaluate_waveform(WAVE_SINE, voice->phase[1]) * key_scale[1] * e2;
+                        float op1 = evaluate_waveform(WAVE_SINE, voice->phase[0] + op2 * pm2) * patch->op[0].level * key_scale[0] * e1;
+                        voice_out = op1;
+                        break;
+                    }
+                }
+
+                // Advance phases
+                voice->phase[0] = fmodf(voice->phase[0] + inc1, 1.0f);
+                voice->phase[1] = fmodf(voice->phase[1] + inc2, 1.0f);
+                voice->phase[2] = fmodf(voice->phase[2] + inc3, 1.0f);
+
+                // SVF Filter
+                float env_cutoff_mod = f_env * patch->filter.env_amount * 8000.0f;
+                float effective_cutoff = fmaxf(20.0f, fminf(20000.0f, patch->filter.cutoff_hz + env_cutoff_mod + cutoff_mod * 3000.0f));
+                // Diagnostic pure-sine mode bypasses the filter completely.
+                // This isolates oscillator + phase accumulator + I2S from all DSP coloration.
+                /* Diagnostic modes 10..18 isolate oscillator/modulation and bypass the filter.
+                 * Mode 9 intentionally keeps the filter in-circuit. */
+                float filtered = (patch->algorithm == 8 || patch->algorithm >= 10)
+                               ? voice_out
+                               : svf_process(voice, voice_out, effective_cutoff, patch->filter.resonance, patch->filter.type);
+
+                /* Per-voice post-filter energy fence. A resonant SVF or
+                 * feedback patch must never hand an unbounded signal to the
+                 * poly mixer. NaN/Inf is treated as silence so one bad voice
+                 * cannot poison the whole stereo stream. */
+                if (!isfinite(filtered)) {
+                    filtered = 0.0f;
+                } else {
+                    filtered = fmaxf(-VOICE_POST_FILTER_PEAK,
+                                     fminf(VOICE_POST_FILTER_PEAK, filtered));
+                }
+
+                sample_mix += filtered;
+            }
+
+            active_count = current_active;
+
+            /*
+             * Dedicated bounded polyphonic mixer. Each voice has already
+             * been fenced at +/-0.50, so use equal-power-safe average gain
+             * by active voice count with additional fixed headroom. This
+             * keeps chords from becoming a gain-dependent distortion source.
+             * No tanh is used in the normal audio path.
+             */
+            if (current_active > 0) {
+                sample_mix *= (POLY_MIX_HEADROOM / (float)current_active);
+            } else {
+                sample_mix = 0.0f;
+            }
+
+            // Amplitude scaling from LFO and master volume
+            float amp = fmaxf(0.0f, 1.0f + amp_mod) * patch->master_volume;
+            sample_mix *= amp;
+
+            /* Final limiter is a last-resort safety fence only. It should be
+             * unreachable for normal presets because the mixer and master
+             * gain are bounded upstream. */
+            float clipped = fmaxf(-FINAL_SAFETY_PEAK,
+                                  fminf(FINAL_SAFETY_PEAK, sample_mix));
+            if (!isfinite(clipped)) clipped = 0.0f;
+
+            // Store in mini scope buffer for OLED
+            if (s < 128) {
+                g_synth.scope_buffer[s] = clipped;
+            }
+
+            int16_t sample_i16 = (int16_t)(clipped * 32767.0f);
+            dma_stereo_buffer[s * 2] = sample_i16;     // Left
+            dma_stereo_buffer[s * 2 + 1] = sample_i16; // Right
+        }
+
+        g_synth.active_voices = active_count;
+
+        // Push to I2S DMA
+        i2s_channel_write(s_tx_chan, dma_stereo_buffer, sizeof(dma_stereo_buffer), &bytes_written, portMAX_DELAY);
+    }
+}

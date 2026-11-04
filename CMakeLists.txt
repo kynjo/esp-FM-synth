@@ -1,0 +1,20 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        "synth_engine.c"
+        "sh1106.c"
+        "ui_menu.c"
+        "midi_usb.c"
+        "usb_descriptors.c"
+        "preset_manager.c"
+    INCLUDE_DIRS
+        "."
+    REQUIRES
+        esp_driver_gpio
+        esp_driver_i2s
+        esp_driver_i2c
+        nvs_flash
+        esp_tinyusb
+        esp_timer
+        freertos
+)
